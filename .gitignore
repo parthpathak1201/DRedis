@@ -1,0 +1,7 @@
+*.aof
+cmake-build-*/
+build_*/
+*.id
+
+/scripts/
+.idea/

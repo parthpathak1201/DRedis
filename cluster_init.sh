@@ -164,3 +164,7 @@ echo "  ────────"
 echo "   docker rm -f \$(docker ps -a --filter \"label=demo=$NET\" --format \"{{.ID}}\") && docker network rm $NET"
 echo ""
 info "Happy demoing!"
+
+
+# benchmark command ->
+#  for i in {0..9}; do docker run -d --name=bench-node$i --network=dredis-demo redis:alpine redis-benchmark -h node$i -p 6380 -c 10 -n 20000 -t set,get -q; done && echo "Testing... waiting 15 seconds" && sleep 15 && for i in {0..9}; do echo "=== node$i ==="; docker logs bench-node$i 2>&1 | grep -E "SET|GET|Error"; done && docker rm -f $(docker ps -a -q --filter name=bench-node) > /dev/null

@@ -224,6 +224,12 @@ namespace RESP {
 
     bool Parser::next(COMMAND &cmd) {
         cmd = {commandType::UNKNOWN, {}};
+
+        // Skip bare \r\n that may have accumulated (e.g. from bench/clients)
+        while (cursor + 1 < buffer.size() && buffer[cursor] == '\r' && buffer[cursor + 1] == '\n')
+            cursor += 2;
+        if (cursor > 0) buffer.erase(0, cursor), cursor = 0;
+
         size_t initial_cursor = cursor;
 
         if (cursor >= buffer.size()) return false;
@@ -255,7 +261,7 @@ namespace RESP {
             }
 
             extracted_strings.reserve(count);
-            for (int i = 0; i < count; i++) {
+            for (int64_t i = 0; i < count; i++) {
                 if (cursor >= buffer.size() || buffer[cursor] != '$') {
                     cursor = initial_cursor; return false;
                 }
@@ -343,16 +349,26 @@ namespace BIN {
 
         std::memcpy(&out.header, buffer.data(), sizeof(FrameHeader));
 
-        if (out.header.magic != BIN::MAGIC) return false;
-        if (out.header.version > 1) return false;
-        // Basic sanity check for payload length
-        if (out.header.payload_len > 10 * 1024 * 1024) return false; // 10MB limit
+        if (out.header.magic != BIN::MAGIC) {
+            buffer.erase(0, 1);
+            return false;
+        }
+        if (out.header.version > 1) {
+            buffer.erase(0, sizeof(FrameHeader));
+            return false;
+        }
+        if (out.header.payload_len > 10 * 1024 * 1024) {
+            buffer.erase(0, sizeof(FrameHeader));
+            return false;
+        }
         if (buffer.size() < sizeof(FrameHeader) + out.header.payload_len) return false;
 
         out.payload = buffer.substr(sizeof(FrameHeader), out.header.payload_len);
 
-        // Now the checksum validation will work correctly.
-        if (calculate_checksum(out.header, out.payload) != out.header.checksum) return false;
+        if (calculate_checksum(out.header, out.payload) != out.header.checksum) {
+            buffer.erase(0, sizeof(FrameHeader) + out.header.payload_len);
+            return false;
+        }
 
         buffer.erase(0, sizeof(FrameHeader) + out.header.payload_len);
         return true;

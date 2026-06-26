@@ -82,6 +82,7 @@ struct PendingGather {
 
 struct PendingProxy {
     int client_fd;
+    uint64_t peer_id;
     int64_t created_at;
 };
 
@@ -114,12 +115,15 @@ void connect_to_peers();
 void set_seed_addresses(const std::vector<NodeID>& seeds);
 PeerConnection* get_or_connect(uint64_t node_id, const str& ip, uint16_t port);
 void handle_peer_read(PeerConnection& peer, uint64_t peer_node_id);
-void handle_peer_write(PeerConnection& peer);
+void handle_peer_write(PeerConnection& peer, uint64_t peer_node_id);
 void process_bin_frame(const BIN::Frame& frame, uint64_t peer_node_id);
 void send_heartbeats();
 void flush_replica_queue();
 void reconnect_peers();
 void run_background_tasks();
+
+// Cancel all pending proxy requests for a peer (called when the connection drops)
+void cancel_pending_proxy_for_peer(uint64_t peer_id);
 
 // Used by both network.cpp and dispatcher.cpp
 std::vector<str> split_resp_responses(const str& data);

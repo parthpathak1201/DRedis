@@ -25,6 +25,6 @@ EXPOSE 6380
 EXPOSE 6381
 
 HEALTHCHECK --interval=30s --timeout=3s \
-  CMD redis-cli ping || exit 1
+  CMD redis-cli -p 6380 ping || exit 1
 
 CMD ["DRedis"]

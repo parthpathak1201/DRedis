@@ -4,6 +4,8 @@
 #include "cmd.h"
 #include "store.h"
 #include "network.h"
+#include <iostream>
+#include <algorithm>
 #include <chrono>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -24,11 +26,15 @@ std::vector<str> extract_keys(const COMMAND& cmd) {
             return {};
         case commandType::MGET:
         case commandType::DEL:
-        case commandType::EXISTS:
-            return cmd.args;
+        case commandType::EXISTS: {
+            std::vector<str> keys;
+            for (size_t i = 1; i < cmd.args.size(); i++)
+                keys.push_back(cmd.args[i]);
+            return keys;
+        }
         case commandType::MSET: {
             std::vector<str> keys;
-            for (size_t i = 0; i < cmd.args.size(); i += 2)
+            for (size_t i = 1; i < cmd.args.size(); i += 2)
                 keys.push_back(cmd.args[i]);
             return keys;
         }
@@ -55,6 +61,13 @@ ReplicaQueueResult queue_replica(const str& raw_cmd, const std::vector<NodeID>& 
     bool any_connected = false;
     for (auto id : ids) {
         auto pit = peers_by_node_id.find(id);
+        // Try lazy connection if no fd exists yet
+        if (pit == peers_by_node_id.end() || pit->second.fd < 0) {
+            auto cit = cluster_state.find(NodeID{id, "", 0});
+            if (cit != cluster_state.end())
+                get_or_connect(id, cit->first.ip, cit->first.port);
+            pit = peers_by_node_id.find(id);
+        }
         if (pit != peers_by_node_id.end() && pit->second.fd >= 0) {
             if (!is_socket_alive(pit->second.fd)) {
                 fd_to_peer_id.erase(pit->second.fd);
@@ -79,7 +92,7 @@ ReplicaQueueResult queue_replica(const str& raw_cmd, const std::vector<NodeID>& 
     return ReplicaQueueResult::QUEUED;
 }
 
-static void embed_vclock(TOKENS& args, const Key& key) {
+void embed_vclock(TOKENS& args, const Key& key) {
     ValueEntry* entry = store_get(key);
     if (!entry || entry->VecClk.empty()) return;
     args.push_back("VCLOCK");
@@ -228,7 +241,7 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         if (cmd.type == commandType::MGET) {
             TOKENS local_args;
             for (auto idx : local_indices)
-                local_args.push_back(cmd.args[idx]);
+                local_args.push_back(cmd.args[idx + 1]);
             COMMAND local_cmd = cmd;
             local_cmd.args = local_args;
             auto elements = split_resp_responses(execute_command(local_cmd));
@@ -237,8 +250,8 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         } else if (cmd.type == commandType::MSET) {
             TOKENS local_args;
             for (auto idx : local_indices) {
-                local_args.push_back(cmd.args[2 * idx]);
                 local_args.push_back(cmd.args[2 * idx + 1]);
+                local_args.push_back(cmd.args[2 * idx + 2]);
             }
             COMMAND local_cmd = cmd;
             local_cmd.args = local_args;
@@ -246,20 +259,42 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         } else {
             TOKENS local_args;
             for (auto idx : local_indices)
-                local_args.push_back(cmd.args[idx]);
+                local_args.push_back(cmd.args[idx + 1]);
             COMMAND local_cmd = cmd;
             local_cmd.args = local_args;
             str local_resp = execute_command(local_cmd);
             if (!local_resp.empty() && local_resp[0] == ':')
                 accumulated += std::atol(local_resp.c_str() + 1);
         }
-        // Persist vector clock in AOF for locally-executed keys
+        // Persist locally-executed keys: embed VCLOCK, AOF, replicate
         if (is_write_command(cmd.type) && !cmd.from_replication) {
+            COMMAND local_cmd = cmd;
+            local_cmd.args.clear();
             for (auto idx : local_indices) {
+                if (cmd.type == commandType::MSET) {
+                    local_cmd.args.push_back(cmd.args[2 * idx + 1]);
+                    local_cmd.args.push_back(cmd.args[2 * idx + 2]);
+                } else {
+                    local_cmd.args.push_back(cmd.args[idx + 1]);
+                }
+            }
+            for (auto idx : local_indices) {
+                str key;
                 if (cmd.type == commandType::MSET)
-                    append_vclock_aof(cmd.args[idx]);
+                    key = cmd.args[2 * idx + 1];
                 else
-                    append_vclock_aof(cmd.args[idx]);
+                    key = cmd.args[idx + 1];
+                embed_vclock(local_cmd.args, key);
+            }
+            str embedded = RESP::serialize_command(local_cmd);
+            appendAOF(embedded);
+            if (!local_indices.empty()) {
+                str any_key;
+                if (cmd.type == commandType::MSET)
+                    any_key = cmd.args[2 * local_indices[0] + 1];
+                else
+                    any_key = cmd.args[local_indices[0] + 1];
+                queue_replica(embedded, get_replicas(any_key), -1, "");
             }
         }
     }
@@ -274,15 +309,15 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         TOKENS remote_args;
         if (cmd.type == commandType::MGET) {
             for (auto idx : indices)
-                remote_args.push_back(cmd.args[idx]);
+                remote_args.push_back(cmd.args[idx + 1]);
         } else if (cmd.type == commandType::MSET) {
             for (auto idx : indices) {
-                remote_args.push_back(cmd.args[2 * idx]);
                 remote_args.push_back(cmd.args[2 * idx + 1]);
+                remote_args.push_back(cmd.args[2 * idx + 2]);
             }
         } else {
             for (auto idx : indices)
-                remote_args.push_back(cmd.args[idx]);
+                remote_args.push_back(cmd.args[idx + 1]);
         }
 
         COMMAND remote_cmd = cmd;
@@ -356,121 +391,79 @@ void Dispatcher::dispatch(Client& client, COMMAND& cmd) {
             for (auto& k : keys) embed_vclock(cmd.args, k);
             str embedded = RESP::serialize_command(cmd);
             appendAOF(embedded);
-            auto qr = queue_replica(embedded, get_replicas(keys[0]),
-                                    client.fd, response);
-            if (qr == ReplicaQueueResult::QUEUED) return;
-            if (qr == ReplicaQueueResult::STRICT_FAIL) {
-                client.write_buf += RESP::error("not enough replicas reachable");
-                return;
-            }
+            queue_replica(embedded, get_replicas(keys[0]), -1, "");
         }
         client.write_buf += response;
     } else {
+        if (is_write_command(cmd.type)) {
+            uint16_t slot = crc16(keys[0]) & 0x3FFF;
+            client.write_buf += RESP::error_moved(slot, owner.ip, owner.port);
+            return;
+        }
+
         NodeID target = owner;
-        // For read commands, if owner is SUSPECT/DEAD, try an ALIVE replica
-        if (!is_write_command(cmd.type)) {
-            auto it = cluster_state.find(owner);
-            if (it == cluster_state.end() || it->second != NodeStatus::ALIVE) {
-                auto replicas = get_replicas(keys[0]);
-                for (const auto& r : replicas) {
-                    if (r.id == self_node.id) {
-                        auto local_response = execute_command(cmd);
-                        std::vector<uint64_t> other_replicas;
-                        for (const auto& rep : replicas) {
-                            if (rep.id == self_node.id) continue;
-                            auto sit2 = cluster_state.find(rep);
-                            if (sit2 != cluster_state.end() && sit2->second == NodeStatus::ALIVE)
-                                other_replicas.push_back(rep.id);
-                        }
-                        if (other_replicas.empty()) {
-                            client.write_buf += local_response;
-                            return;
-                        }
-                        std::unordered_map<uint64_t, counter> best_vclock;
-                        auto* entry = store_get(keys[0]);
-                        if (entry) best_vclock = entry->VecClk;
-                        static uint64_t read_msg_id = 1;
-                        uint64_t msg_id = read_msg_id++;
-                        str request_payload = RESP::serialize_command(cmd);
-                        for (auto rep_id : other_replicas) {
-                            auto pit = peers_by_node_id.find(rep_id);
-                            if (pit == peers_by_node_id.end() || pit->second.fd < 0) continue;
-                            BIN::Frame req;
-                            req.header = {
-                                .magic = BIN::MAGIC, .version = BIN::VERSION,
-                                .msg_type = static_cast<uint8_t>(BIN::FrameType::READ_REQUEST),
-                                .msg_id = msg_id, .sender_id = self_node.id,
-                                .payload_len = static_cast<uint32_t>(request_payload.size()), .checksum = 0
-                            };
-                            req.payload = request_payload;
-                            auto serialized = BIN::serialize(req);
-                            bool was_empty = pit->second.write_buf.empty();
-                            pit->second.write_buf += serialized;
-                            if (was_empty) {
-                                uint32_t flags = EPOLLIN | EPOLLOUT;
-                                mod_epoll(pit->second.fd, flags);
-                            }
-                        }
-                        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        int remote_needed = std::max(config().read_quorum - 1, 1);
-                        if (remote_needed > static_cast<int>(other_replicas.size()))
-                            remote_needed = static_cast<int>(other_replicas.size());
-                        pending_reads[msg_id] = {
-                            local_response, best_vclock, client.fd,
-                            remote_needed, 0, now_ms,
-                            keys[0], best_vclock
-                        };
+        auto it = cluster_state.find(owner);
+        if (it == cluster_state.end() || it->second != NodeStatus::ALIVE) {
+            auto replicas = get_replicas(keys[0]);
+            for (const auto& r : replicas) {
+                if (r.id == self_node.id) {
+                    auto local_response = execute_command(cmd);
+                    std::vector<uint64_t> other_replicas;
+                    for (const auto& rep : replicas) {
+                        if (rep.id == self_node.id) continue;
+                        auto sit2 = cluster_state.find(rep);
+                        if (sit2 != cluster_state.end() && sit2->second == NodeStatus::ALIVE)
+                            other_replicas.push_back(rep.id);
+                    }
+                    if (other_replicas.empty()) {
+                        client.write_buf += local_response;
                         return;
                     }
-                    auto sit = cluster_state.find(r);
-                    if (sit != cluster_state.end() && sit->second == NodeStatus::ALIVE) {
-                        target = r;
-                        break;
+                    std::unordered_map<uint64_t, counter> best_vclock;
+                    auto* entry = store_get(keys[0]);
+                    if (entry) best_vclock = entry->VecClk;
+                    static uint64_t read_msg_id = 1;
+                    uint64_t msg_id = read_msg_id++;
+                    str request_payload = RESP::serialize_command(cmd);
+                    for (auto rep_id : other_replicas) {
+                        auto pit = peers_by_node_id.find(rep_id);
+                        if (pit == peers_by_node_id.end() || pit->second.fd < 0) continue;
+                        BIN::Frame req;
+                        req.header = {
+                            .magic = BIN::MAGIC, .version = BIN::VERSION,
+                            .msg_type = static_cast<uint8_t>(BIN::FrameType::READ_REQUEST),
+                            .msg_id = msg_id, .sender_id = self_node.id,
+                            .payload_len = static_cast<uint32_t>(request_payload.size()), .checksum = 0
+                        };
+                        req.payload = request_payload;
+                        auto serialized = BIN::serialize(req);
+                        bool was_empty = pit->second.write_buf.empty();
+                        pit->second.write_buf += serialized;
+                        if (was_empty) {
+                            uint32_t flags = EPOLLIN | EPOLLOUT;
+                            mod_epoll(pit->second.fd, flags);
+                        }
                     }
+                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    int remote_needed = std::max(config().read_quorum - 1, 1);
+                    if (remote_needed > static_cast<int>(other_replicas.size()))
+                        remote_needed = static_cast<int>(other_replicas.size());
+                    pending_reads[msg_id] = {
+                        local_response, best_vclock, client.fd,
+                        remote_needed, 0, now_ms,
+                        keys[0], best_vclock
+                    };
+                    return;
+                }
+                auto sit = cluster_state.find(r);
+                if (sit != cluster_state.end() && sit->second == NodeStatus::ALIVE) {
+                    target = r;
+                    break;
                 }
             }
         }
-        // Proxy command to the target node (owner or replica) via PROXY_REQUEST
-        static uint64_t proxy_msg_id = 1;
-        str proxy_payload = RESP::serialize_command(cmd);
-        uint64_t msg_id = proxy_msg_id++;
-
-        BIN::Frame req;
-        req.header = {
-            .magic = BIN::MAGIC, .version = BIN::VERSION,
-            .msg_type = static_cast<uint8_t>(BIN::FrameType::PROXY_REQUEST),
-            .msg_id = msg_id, .sender_id = self_node.id,
-            .payload_len = static_cast<uint32_t>(proxy_payload.size()), .checksum = 0
-        };
-        req.payload = std::move(proxy_payload);
-        auto serialized = BIN::serialize(req);
-
-        auto pit = peers_by_node_id.find(target.id);
-        if (pit != peers_by_node_id.end() && pit->second.fd >= 0) {
-            if (!is_socket_alive(pit->second.fd)) {
-                fd_to_peer_id.erase(pit->second.fd);
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, pit->second.fd, nullptr);
-                close(pit->second.fd);
-                pit->second.fd = -1;
-                pit->second.needs_full_sync = true;
-            } else {
-                bool was_empty = pit->second.write_buf.empty();
-                pit->second.write_buf += serialized;
-                if (was_empty) {
-                    uint32_t flags = EPOLLIN | EPOLLOUT;
-                    mod_epoll(pit->second.fd, flags);
-                }
-                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                pending_proxy[msg_id] = {client.fd, now_ms};
-                return;
-            }
-        }
-
-        // Fallback: MOVED if target unreachable
-        uint64_t token = hash_token(keys[0]);
-        uint16_t slot = static_cast<uint16_t>(token % 16384);
+        uint16_t slot = crc16(keys[0]) & 0x3FFF;
         client.write_buf += RESP::error_moved(slot, target.ip, target.port);
     }
 }

@@ -395,75 +395,37 @@ void Dispatcher::dispatch(Client& client, COMMAND& cmd) {
         }
         client.write_buf += response;
     } else {
-        if (is_write_command(cmd.type)) {
-            uint16_t slot = crc16(keys[0]) & 0x3FFF;
-            client.write_buf += RESP::error_moved(slot, owner.ip, owner.port);
+        // Proxy command to the owner node
+        static uint64_t proxy_msg_id = 1;
+        str proxy_payload = RESP::serialize_command(cmd);
+        uint64_t msg_id = proxy_msg_id++;
+
+        BIN::Frame req;
+        req.header = {
+            .magic = BIN::MAGIC, .version = BIN::VERSION,
+            .msg_type = static_cast<uint8_t>(BIN::FrameType::PROXY_REQUEST),
+            .msg_id = msg_id, .sender_id = self_node.id,
+            .payload_len = static_cast<uint32_t>(proxy_payload.size()), .checksum = 0
+        };
+        req.payload = std::move(proxy_payload);
+        auto serialized = BIN::serialize(req);
+
+        auto pit = peers_by_node_id.find(owner.id);
+        if (pit != peers_by_node_id.end() && pit->second.fd >= 0) {
+            bool was_empty = pit->second.write_buf.empty();
+            pit->second.write_buf += serialized;
+            if (was_empty) {
+                uint32_t flags = EPOLLIN | EPOLLOUT;
+                mod_epoll(pit->second.fd, flags);
+            }
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            pending_proxy[msg_id] = {client.fd, owner.id, now_ms};
             return;
         }
 
-        NodeID target = owner;
-        auto it = cluster_state.find(owner);
-        if (it == cluster_state.end() || it->second != NodeStatus::ALIVE) {
-            auto replicas = get_replicas(keys[0]);
-            for (const auto& r : replicas) {
-                if (r.id == self_node.id) {
-                    auto local_response = execute_command(cmd);
-                    std::vector<uint64_t> other_replicas;
-                    for (const auto& rep : replicas) {
-                        if (rep.id == self_node.id) continue;
-                        auto sit2 = cluster_state.find(rep);
-                        if (sit2 != cluster_state.end() && sit2->second == NodeStatus::ALIVE)
-                            other_replicas.push_back(rep.id);
-                    }
-                    if (other_replicas.empty()) {
-                        client.write_buf += local_response;
-                        return;
-                    }
-                    std::unordered_map<uint64_t, counter> best_vclock;
-                    auto* entry = store_get(keys[0]);
-                    if (entry) best_vclock = entry->VecClk;
-                    static uint64_t read_msg_id = 1;
-                    uint64_t msg_id = read_msg_id++;
-                    str request_payload = RESP::serialize_command(cmd);
-                    for (auto rep_id : other_replicas) {
-                        auto pit = peers_by_node_id.find(rep_id);
-                        if (pit == peers_by_node_id.end() || pit->second.fd < 0) continue;
-                        BIN::Frame req;
-                        req.header = {
-                            .magic = BIN::MAGIC, .version = BIN::VERSION,
-                            .msg_type = static_cast<uint8_t>(BIN::FrameType::READ_REQUEST),
-                            .msg_id = msg_id, .sender_id = self_node.id,
-                            .payload_len = static_cast<uint32_t>(request_payload.size()), .checksum = 0
-                        };
-                        req.payload = request_payload;
-                        auto serialized = BIN::serialize(req);
-                        bool was_empty = pit->second.write_buf.empty();
-                        pit->second.write_buf += serialized;
-                        if (was_empty) {
-                            uint32_t flags = EPOLLIN | EPOLLOUT;
-                            mod_epoll(pit->second.fd, flags);
-                        }
-                    }
-                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    int remote_needed = std::max(config().read_quorum - 1, 1);
-                    if (remote_needed > static_cast<int>(other_replicas.size()))
-                        remote_needed = static_cast<int>(other_replicas.size());
-                    pending_reads[msg_id] = {
-                        local_response, best_vclock, client.fd,
-                        remote_needed, 0, now_ms,
-                        keys[0], best_vclock
-                    };
-                    return;
-                }
-                auto sit = cluster_state.find(r);
-                if (sit != cluster_state.end() && sit->second == NodeStatus::ALIVE) {
-                    target = r;
-                    break;
-                }
-            }
-        }
+        // Fallback: MOVED if owner unreachable
         uint16_t slot = crc16(keys[0]) & 0x3FFF;
-        client.write_buf += RESP::error_moved(slot, target.ip, target.port);
+        client.write_buf += RESP::error_moved(slot, owner.ip, owner.port);
     }
 }

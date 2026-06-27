@@ -172,11 +172,12 @@ void store_set(const Key& key, ValueEntry&& entry) {
         auto it = STORE.find(key);
         if (it != STORE.end()) {
             auto cmp = compare_vclock(entry.VecClk, it->second.VecClk);
-            if (cmp == VClockCmp::OLDER) return;
+            if (cmp == VClockCmp::OLDER) {
+                std::cout << "[LWW] OLDER: rejecting update for " << key << std::endl;
+                return;
+            }
             if (cmp == VClockCmp::CONCURRENT) {
-                str local_data = serialize_value_for_lww(it->second);
-                str incoming_data = serialize_value_for_lww(entry);
-                if (local_data >= incoming_data) return;
+                std::cout << "[LWW] CONCURRENT: accepting incoming update for " << key << std::endl;
             }
         }
     }

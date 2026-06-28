@@ -18,6 +18,7 @@ extern Dispatcher dispatcher;
 
 // Exposed helper functions used by the PROXY_REQUEST handler in network.cpp
 std::vector<str> extract_keys(const COMMAND& cmd);
+void embed_vclock(TOKENS& args, const std::string& key);
 void append_vclock_aof(const str& key);
 enum class ReplicaQueueResult {
     QUEUED = 1,

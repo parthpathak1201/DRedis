@@ -55,9 +55,6 @@ static void init_cluster_node(uint64_t node_id, uint64_t generation) {
     set_seed_addresses(seeds);
     connect_to_peers();
 
-    std::cout << "\033[32m[DRedis] running on port " << config().client_port
-            << " cluster port " << config().effective_cluster_port()
-            << " node_id " << node_id << "\033[0m" << std::endl;
 }
 
 static void configure_system() {

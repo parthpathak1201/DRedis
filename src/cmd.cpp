@@ -2,8 +2,11 @@
 #include <charconv>
 #include <chrono>
 #include <sstream>
+#include <iostream>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <unordered_map>
+#include <utility>
 
 #include "parser.h"
 #include "cmd.h"
@@ -35,8 +38,11 @@ static bool parse_trailing_vclock(const TOKENS& args, size_t start,
     for (int64_t i = 0; i < count; i++) {
         size_t pos = start + 2 + static_cast<size_t>(i) * 2;
         if (pos + 1 >= args.size()) return false;
-        uint64_t nid = static_cast<uint64_t>(std::atol(args[pos].c_str()));
-        counter cnt = static_cast<counter>(std::atol(args[pos + 1].c_str()));
+        uint64_t nid, cnt;
+        auto [p, ec] = std::from_chars(args[pos].data(), args[pos].data() + args[pos].size(), nid);
+        if (ec != std::errc()) return false;
+        auto [p2, ec2] = std::from_chars(args[pos + 1].data(), args[pos + 1].data() + args[pos + 1].size(), cnt);
+        if (ec2 != std::errc()) return false;
         vclock[nid] = cnt;
     }
     return true;
@@ -94,7 +100,11 @@ str handle_set(const TOKENS &args) {
     entry.expiry_ms = expiry;
     if (g_replication_mode) {
         std::unordered_map<uint64_t, counter> parsed_vclock;
-        if (parse_trailing_vclock(args, idx, parsed_vclock))
+        size_t vclock_pos = args.size();
+        for (size_t vi = idx; vi < args.size(); vi++) {
+            if (args[vi] == "VCLOCK") { vclock_pos = vi; break; }
+        }
+        if (vclock_pos < args.size() && parse_trailing_vclock(args, vclock_pos, parsed_vclock))
             entry.VecClk = std::move(parsed_vclock);
     }
     store_set(args[0], std::move(entry));
@@ -171,22 +181,26 @@ static int del_single(const str &key) {
 
 str handle_del(const TOKENS &args) {
     if (args.empty()) return RESP::error("wrong number of arguments for 'del' command");
-    // Replication mode with embedded VCLOCK (single-key tombstone)
-    if (g_replication_mode && args.size() >= 3) {
+    size_t data_end = args.size();
+    if (g_replication_mode) {
+        for (size_t i = args.size(); i > 0; ) {
+            i--;
+            if (args[i] == "VCLOCK") { data_end = i; break; }
+        }
+    }
+    if (data_end == 1 && data_end < args.size()) {
         std::unordered_map<uint64_t, counter> parsed_vclock;
-        if (parse_trailing_vclock(args, 1, parsed_vclock)) {
+        if (parse_trailing_vclock(args, data_end, parsed_vclock)) {
             ValueEntry te;
             te.type = Type::TOMBSTONE;
-            te.value = std::monostate{};
-            te.expiry_ms = -1;
             te.VecClk = std::move(parsed_vclock);
             store_set(args[0], std::move(te));
             return RESP::integer(1);
         }
     }
     int count = 0;
-    for (const auto &key: args)
-        count += del_single(key);
+    for (size_t i = 0; i < data_end; i++)
+        count += del_single(args[i]);
     return RESP::integer(count);
 }
 
@@ -330,7 +344,15 @@ str handle_mget(const TOKENS &args) {
 str handle_mset(const TOKENS &args) {
     if (args.size() < 2 || args.size() % 2 != 0)
         return RESP::error("wrong number of arguments for 'mset' command");
-    for (size_t i = 0; i < args.size(); i += 2) {
+    size_t data_end = args.size();
+    if (g_replication_mode) {
+        for (size_t i = args.size(); i > 0; ) {
+            i--;
+            if (args[i] == "VCLOCK") { data_end = i; break; }
+        }
+        if (data_end % 2 != 0) data_end = args.size();
+    }
+    for (size_t i = 0; i < data_end; i += 2) {
         ValueEntry entry;
         entry.type = Type::STRING;
         entry.value = args[i + 1];
@@ -346,7 +368,8 @@ str handle_hset(const TOKENS &args) {
     // Find data end (account for trailing VCLOCK in replication mode)
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -513,7 +536,8 @@ str handle_sadd(const TOKENS &args) {
     if (args.size() < 2) return RESP::error("wrong number of arguments for 'sadd' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -634,7 +658,8 @@ str handle_zadd(const TOKENS &args) {
     if (args.size() < 3) return RESP::error("wrong number of arguments for 'zadd' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -985,7 +1010,8 @@ str handle_rpush(const TOKENS &args) {
     if (args.size() < 2) return RESP::error("wrong number of arguments for 'rpush' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -1240,6 +1266,23 @@ str handle_ping(const TOKENS &) {
     return RESP::pong();
 }
 
+static std::unordered_map<uint64_t, std::vector<std::pair<uint16_t, uint16_t>>> compute_all_slot_ranges() {
+    std::unordered_map<uint64_t, std::vector<std::pair<uint16_t, uint16_t>>> result;
+    for (size_t i = 0; i < 16384; ) {
+        NodeID owner = slot_owners[i];
+        if (owner.id == 0 && self_node.id != 0) owner = self_node;
+        size_t end = i;
+        while (end < 16383) {
+            NodeID next_owner = slot_owners[end + 1];
+            if (next_owner.id != owner.id) break;
+            end++;
+        }
+        result[owner.id].push_back({static_cast<uint16_t>(i), static_cast<uint16_t>(end)});
+        i = end + 1;
+    }
+    return result;
+}
+
 str handle_cluster(const TOKENS &args) {
     if (args.empty()) return RESP::error("wrong number of arguments for 'cluster' command");
     const str &sub = args[0];
@@ -1265,18 +1308,37 @@ str handle_cluster(const TOKENS &args) {
         return RESP::bulk_string(res);
     }
     if (sub == "NODES") {
+        // Build slot ranges once (shared with CLUSTER SLOTS below)
+        auto ranges = compute_all_slot_ranges();
         str res;
         for (const auto &[node, status]: cluster_state) {
-            res += std::to_string(node.id) + " " + node.ip + ":" + std::to_string(node.port) + " ";
+            res += std::to_string(node.id) + " ";
+            res += node.ip + ":" + std::to_string(node.port) + "@" + std::to_string(node.port) + " ";
+            // flags
+            if (node.id == self_node.id)
+                res += "myself,";
             switch (status) {
-                case NodeStatus::ALIVE: res += "alive";
-                    break;
-                case NodeStatus::SUSPECT: res += "suspect";
-                    break;
-                case NodeStatus::DEAD: res += "dead";
-                    break;
-                case NodeStatus::LEFT: res += "left";
-                    break;
+                case NodeStatus::ALIVE: res += "master"; break;
+                case NodeStatus::SUSPECT: res += "master,fail?"; break;
+                case NodeStatus::DEAD: res += "master,fail"; break;
+                case NodeStatus::LEFT: res += "master"; break;
+            }
+            res += " ";
+            // master-id (all masters)
+            res += "- ";
+            // ping-sent, pong-recv, config-epoch
+            res += "0 0 0 ";
+            // link-state
+            res += "connected ";
+            // slot ranges for this node
+            auto rit = ranges.find(node.id);
+            if (rit != ranges.end()) {
+                for (auto &[s, e] : rit->second) {
+                    if (s == e)
+                        res += std::to_string(s) + " ";
+                    else
+                        res += std::to_string(s) + "-" + std::to_string(e) + " ";
+                }
             }
             res += "\n";
         }
@@ -1338,8 +1400,7 @@ str handle_cluster(const TOKENS &args) {
     }
     if (sub == "KEYSLOT") {
         if (args.size() < 2) return RESP::error("wrong number of arguments for 'cluster keyslot' command");
-        uint64_t token = hash_token(args[1]);
-        return RESP::integer(static_cast<long long>(token % 16384));
+        return RESP::integer(static_cast<uint16_t>(hash_token(args[1]) % 16384));
     }
     if (sub == "SLOTS") {
         TOKENS all_entries;

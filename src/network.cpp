@@ -1,7 +1,9 @@
 #include "network.h"
+#include "dispatcher.h"
 
 #include <iostream>
 #include <algorithm>
+#include <random>
 #include <chrono>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -30,7 +32,8 @@ constexpr int MAX_CLIENTS = 10000;
 
 bool is_socket_alive(int fd) {
     struct pollfd pfd = {fd, POLLOUT | POLLIN, 0};
-    int ret = poll(&pfd, 1, 0);
+    int ret;
+    do { ret = poll(&pfd, 1, 0); } while (ret < 0 && errno == EINTR);
     if (ret < 0) return false;
     if (ret == 0) {
         // No events ready — could be a pending non-blocking connect (EINPROGRESS)
@@ -38,7 +41,7 @@ bool is_socket_alive(int fd) {
         int so_error = 0;
         socklen_t len = sizeof(so_error);
         getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
-        return so_error == 0;
+        return so_error == 0 || so_error == EINPROGRESS;
     }
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL | POLLRDHUP)) return false;
     char tmp;
@@ -59,12 +62,6 @@ static void set_tcp_keepalive(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
-static int64_t current_time_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    ).count();
-}
-
 void init_server(str port) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -80,7 +77,7 @@ void init_server(str port) {
         std::perror("Bind failed");
         exit(1);
     }
-    listen(server_fd, 10);
+    listen(server_fd, SOMAXCONN);
 
     epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
@@ -114,13 +111,11 @@ void init_dashboard_server() {
         dashboard_server_fd = -1;
         return;
     }
-    listen(dashboard_server_fd, 10);
+    listen(dashboard_server_fd, SOMAXCONN);
     struct epoll_event ev{};
     ev.events = EPOLLIN;
     ev.data.fd = dashboard_server_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dashboard_server_fd, &ev);
-    std::cout << "\033[32m[DRedis] dashboard listening on port "
-              << config().effective_dashboard_port() << "\033[0m" << std::endl;
 }
 
 void mod_epoll(int fd, uint32_t events) {
@@ -132,9 +127,31 @@ void mod_epoll(int fd, uint32_t events) {
 
 void close_client(int fd) {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-    std::cout << "[DREDIS]: Closing Client-> fd: " << fd << " at " << current_time_ms() << std::endl;
+
+    for (auto it = pending_proxy.begin(); it != pending_proxy.end(); ) {
+        if (it->second.client_fd == fd)
+            it = pending_proxy.erase(it);
+        else
+            ++it;
+    }
+
     close(fd);
     clients.erase(fd);
+}
+
+void cancel_pending_proxy_for_peer(uint64_t peer_id) {
+    for (auto it = pending_proxy.begin(); it != pending_proxy.end(); ) {
+        if (it->second.peer_id != peer_id) { ++it; continue; }
+        auto cit = clients.find(it->second.client_fd);
+        if (cit != clients.end()) {
+            cit->second.write_buf += RESP::error("proxy connection lost");
+            uint32_t flags = EPOLLIN;
+            if (!cit->second.write_buf.empty()) flags |= EPOLLOUT;
+            if (cit->second.read_paused_by_backpressure) flags = EPOLLOUT;
+            mod_epoll(cit->second.fd, flags);
+        }
+        it = pending_proxy.erase(it);
+    }
 }
 
 static void close_dashboard_client(int fd) {
@@ -259,7 +276,7 @@ void accept_new_clients() {
         int yes = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
         clients[client_fd] = {client_fd, {}, {}, false, current_time_ms(), false};
-        std::cout << "\033[33m[DRedis] client connected (fd: " << client_fd << ")\033[0m" << std::endl;
+
         struct epoll_event ev{};
         ev.events = EPOLLIN;
         ev.data.fd = client_fd;
@@ -297,12 +314,16 @@ bool handle_read(Client &c) {
 
                 auto existing = peers_by_node_id.find(sender_id);
                 if (existing != peers_by_node_id.end() && existing->second.fd >= 0) {
+                    // Preserve queued writes from old connection (may contain PROXY_REQUEST frames)
+                    c.write_buf = std::move(existing->second.write_buf);
+                    c.parser.buffer = std::move(existing->second.read_buf);
+                    cancel_pending_proxy_for_peer(sender_id);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, existing->second.fd, nullptr);
                     close(existing->second.fd);
                     peers_by_node_id.erase(sender_id);
                 }
 
-                std::cout << "\033[33m[DRedis] peer connection promoted (fd: " << c.fd << ")\033[0m" << std::endl;
+
                 auto &peer = peers_by_node_id[sender_id];
                 peer.fd = c.fd;
                 peer.write_buf = std::move(c.write_buf);
@@ -337,8 +358,18 @@ bool handle_read(Client &c) {
 
     COMMAND cmd;
     while (true) {
-        size_t cmd_start = c.parser.cursor;
-        if (!c.parser.next(cmd)) break;
+        if (!c.parser.next(cmd)) {
+            if (c.parser.protocol_error) {
+                size_t next_crlf = c.parser.buffer.find("\r\n");
+                if (next_crlf != str::npos) {
+                    c.parser.cursor = next_crlf + 2;
+                    c.parser.clear_consumed();
+                    c.write_buf += RESP::error("protocol error");
+                    continue;
+                }
+            }
+            break;
+        }
         dispatcher.dispatch(c, cmd);
     }
     c.parser.clear_consumed();
@@ -387,6 +418,24 @@ PeerConnection *get_or_connect(uint64_t node_id, const str &ip, uint16_t port) {
     if (it != peers_by_node_id.end() && it->second.fd >= 0)
         return &it->second;
 
+    // If no entry under this ID, check if any existing peer already connects
+    // to the same IP:port (common when seed-hash IDs haven't been migrated yet).
+    for (auto &[nid, p] : peers_by_node_id) {
+        if (p.fd < 0 || nid == node_id) continue;
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof(sa);
+        if (getpeername(p.fd, (struct sockaddr *)&sa, &sl) != 0) continue;
+        char paddr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sa.sin_addr, paddr, sizeof(paddr));
+        if (ntohs(sa.sin_port) == port && ip == paddr) {
+            auto &migrated = peers_by_node_id[node_id];
+            migrated = std::move(p);
+            fd_to_peer_id[migrated.fd] = node_id;
+            peers_by_node_id.erase(nid);
+            return &peers_by_node_id[node_id];
+        }
+    }
+
     // Ensure an entry exists so reconnect_peers() can track backoff.
     auto &peer = peers_by_node_id[node_id];
 
@@ -420,7 +469,6 @@ PeerConnection *get_or_connect(uint64_t node_id, const str &ip, uint16_t port) {
 
     peer.fd = fd;
     fd_to_peer_id[fd] = node_id;
-
     struct epoll_event ev{};
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
@@ -470,6 +518,7 @@ void process_bin_frame(const BIN::Frame &frame, uint64_t peer_node_id) {
                     peers_by_node_id.erase(pit);
                 }
             }
+
             NodeID sender{sid, ip, rport, gen};
             if (cluster_state.find(sender) == cluster_state.end()) {
                 add_node(sender);
@@ -604,24 +653,11 @@ void process_bin_frame(const BIN::Frame &frame, uint64_t peer_node_id) {
             while (p.next(cmd)) {
                 auto k = extract_keys(cmd);
                 if (!k.empty() && is_write_command(cmd.type) && !cmd.from_replication) {
-                    // Execute the write
                     response += execute_command(cmd);
-                    // Persist vclock to AOF
-                    for (auto& kk : k) append_vclock_aof(kk);
-                    // Embed VCLOCK in args for replication
-                    for (auto& kk : k) {
-                        auto* entry = store_get(kk);
-                        if (entry && !entry->VecClk.empty()) {
-                            cmd.args.push_back("VCLOCK");
-                            cmd.args.push_back(std::to_string(entry->VecClk.size()));
-                            for (const auto& [nid, cnt] : entry->VecClk) {
-                                cmd.args.push_back(std::to_string(nid));
-                                cmd.args.push_back(std::to_string(cnt));
-                            }
-                        }
-                    }
-                    // Replicate to all replicas (fire-and-forget — no client to defer to)
-                    queue_replica(RESP::serialize_command(cmd), get_replicas(k[0]),
+                    for (auto& kk : k) embed_vclock(cmd.args, kk);
+                    str embedded = RESP::serialize_command(cmd);
+                    appendAOF(embedded);
+                    queue_replica(embedded, get_replicas(k[0]),
                                   -1, "");
                 } else {
                     response += execute_command(cmd);
@@ -1068,6 +1104,7 @@ void handle_peer_read(PeerConnection &peer, uint64_t peer_node_id) {
     if (n > 0) {
         peer.read_buf.append(buf, n);
     } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        cancel_pending_proxy_for_peer(peer_node_id);
         fd_to_peer_id.erase(peer.fd);
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, peer.fd, nullptr);
         close(peer.fd);
@@ -1111,7 +1148,7 @@ void handle_peer_read(PeerConnection &peer, uint64_t peer_node_id) {
     mod_epoll(peer.fd, flags);
 }
 
-void handle_peer_write(PeerConnection &peer) {
+void handle_peer_write(PeerConnection &peer, uint64_t peer_node_id) {
     if (peer.write_buf.empty()) {
         // EPOLLOUT with no data to write — likely connect completion.
         // Check for deferred connect errors (ECONNREFUSED etc.).
@@ -1119,6 +1156,7 @@ void handle_peer_write(PeerConnection &peer) {
         socklen_t len = sizeof(so_error);
         getsockopt(peer.fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
         if (so_error != 0) {
+            cancel_pending_proxy_for_peer(peer_node_id);
             fd_to_peer_id.erase(peer.fd);
             epoll_ctl(epoll_fd, EPOLL_CTL_DEL, peer.fd, nullptr);
             close(peer.fd);
@@ -1148,11 +1186,14 @@ void handle_peer_write(PeerConnection &peer) {
                 mod_epoll(peer.fd, flags);
             }
         }
+        if (peer.write_buf.empty())
+            mod_epoll(peer.fd, EPOLLIN);
         return;
     }
     ssize_t n = send(peer.fd, peer.write_buf.data(), peer.write_buf.size(), MSG_NOSIGNAL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        cancel_pending_proxy_for_peer(peer_node_id);
         fd_to_peer_id.erase(peer.fd);
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, peer.fd, nullptr);
         close(peer.fd);
@@ -1172,7 +1213,9 @@ void handle_peer_write(PeerConnection &peer) {
 
 void flush_replica_queue() {
     static uint64_t msg_id = 1;
+    auto deadline = current_time_ms() + 5;
     while (!replica_queue.empty()) {
+        if (current_time_ms() >= deadline) break;
         auto &op = replica_queue.front();
         BIN::Frame frame;
         frame.header = {
@@ -1190,6 +1233,14 @@ void flush_replica_queue() {
         int connected_count = 0;
         for (auto id: op.target_ids) {
             auto it = peers_by_node_id.find(id);
+            // Try lazy connection if no fd exists yet
+            if (it == peers_by_node_id.end() || it->second.fd < 0) {
+                auto cit = cluster_state.find(NodeID{id, "", 0});
+                if (cit != cluster_state.end()) {
+                    get_or_connect(id, cit->first.ip, cit->first.port);
+                    it = peers_by_node_id.find(id);
+                }
+            }
             if (it != peers_by_node_id.end() && it->second.fd >= 0) {
                 if (it->second.needs_full_sync) continue;
                 if (!is_socket_alive(it->second.fd)) {
@@ -1198,6 +1249,8 @@ void flush_replica_queue() {
                     close(it->second.fd);
                     it->second.fd = -1;
                     it->second.needs_full_sync = true;
+                    it->second.retry_at = current_time_ms() + (1000 << std::min(it->second.retry_count, 6));
+                    it->second.retry_count++;
                     continue;
                 }
                 it->second.write_buf += serialized;
@@ -1208,11 +1261,24 @@ void flush_replica_queue() {
         if (op.client_fd >= 0 && !op.target_ids.empty()) {
             int wq = std::min(config().write_quorum, static_cast<int>(op.target_ids.size()));
             int target = std::min(wq, connected_count);
-            pending_writes[frame.header.msg_id] = {
-                op.deferred_response, op.client_fd, 0,
-                target,
-                current_time_ms()
-            };
+            if (target > 0) {
+                pending_writes[frame.header.msg_id] = {
+                    op.deferred_response, op.client_fd, 0,
+                    target,
+                    current_time_ms()
+                };
+            } else {
+                auto cit = clients.find(op.client_fd);
+                if (cit != clients.end()) {
+                    cit->second.write_buf += op.deferred_response;
+                    uint32_t flags = EPOLLIN;
+                    if (!cit->second.write_buf.empty())
+                        flags |= EPOLLOUT;
+                    if (cit->second.read_paused_by_backpressure)
+                        flags = EPOLLOUT;
+                    mod_epoll(cit->second.fd, flags);
+                }
+            }
         }
         replica_queue.pop_front();
     }
@@ -1225,11 +1291,7 @@ void set_seed_addresses(const std::vector<NodeID> &seeds) {
 }
 
 void connect_to_peers() {
-    for (const auto &node: get_all_nodes()) {
-        if (node.id > self_node.id)
-            get_or_connect(node.id, node.ip, node.port);
-    }
-    // Connect to seed addresses regardless of ID ordering
+    // Connect only to seed addresses; other peers discovered via gossip
     for (const auto &seed: g_seed_addresses) {
         if (seed.id == self_node.id) continue;
         if (seed.ip == config().ip && seed.port == config().client_port) continue;
@@ -1252,14 +1314,26 @@ void send_heartbeats() {
     };
     frame.payload = std::move(gossip);
     auto serialized = BIN::serialize(frame);
-    for (auto &[nid, peer]: peers_by_node_id) {
-        if (nid != self_node.id && peer.fd >= 0) {
-            bool was_empty = peer.write_buf.empty();
-            peer.write_buf += serialized;
-            if (was_empty) {
-                uint32_t flags = EPOLLIN | EPOLLOUT;
-                mod_epoll(peer.fd, flags);
-            }
+
+    // Epidemic fan-out: send PING to GOSSIP_FANOUT random peers
+    std::vector<uint64_t> targets;
+    for (auto &[nid, peer]: peers_by_node_id)
+        if (nid != self_node.id && peer.fd >= 0)
+            targets.push_back(nid);
+
+    if (targets.size() > (size_t)GOSSIP_FANOUT) {
+        static std::mt19937 rng(std::random_device{}());
+        std::shuffle(targets.begin(), targets.end(), rng);
+        targets.resize(GOSSIP_FANOUT);
+    }
+
+    for (auto nid: targets) {
+        auto &peer = peers_by_node_id[nid];
+        bool was_empty = peer.write_buf.empty();
+        peer.write_buf += serialized;
+        if (was_empty) {
+            uint32_t flags = EPOLLIN | EPOLLOUT;
+            mod_epoll(peer.fd, flags);
         }
     }
 }
@@ -1272,6 +1346,7 @@ void reconnect_peers() {
 
         auto it = cluster_state.find(NodeID{nid, "", 0});
         if (it == cluster_state.end()) continue;
+        if (it->second == NodeStatus::DEAD) continue;
         auto &node = it->first;
 
         get_or_connect(nid, node.ip, node.port);
@@ -1317,9 +1392,9 @@ void run_background_tasks() {
 
     flush_replica_queue();
 
-    // Timeout pending writes after 10s — return error (never ack uncommitted writes)
+    // Timeout pending writes after 5s — return error (never ack uncommitted writes)
     for (auto it = pending_writes.begin(); it != pending_writes.end();) {
-        if (now - it->second.created_at >= 10000) {
+        if (now - it->second.created_at >= 5000) {
             auto cit = clients.find(it->second.client_fd);
             if (cit != clients.end()) {
                 cit->second.write_buf += RESP::error("not enough replicas available, write abandoned");
@@ -1388,9 +1463,9 @@ void run_background_tasks() {
         }
     }
 
-    // Timeout pending proxy requests after 10s
+    // Timeout pending proxy requests after 5s
     for (auto it = pending_proxy.begin(); it != pending_proxy.end();) {
-        if (now - it->second.created_at >= 10000) {
+        if (now - it->second.created_at >= 5000) {
             auto cit = clients.find(it->second.client_fd);
             if (cit != clients.end()) {
                 cit->second.write_buf += RESP::error("proxy request timed out");
@@ -1439,35 +1514,40 @@ void run_background_tasks() {
                 g_rewrite_pending = true;
         }
     }
-    reconnect_peers();
-
-    // Connect to new peers discovered via gossip
-    for (const auto &[node, status]: cluster_state) {
-        if (node.id <= self_node.id) continue;
-        if (status != NodeStatus::ALIVE) continue;
-        if (peers_by_node_id.find(node.id) != peers_by_node_id.end()) continue;
-        get_or_connect(node.id, node.ip, node.port);
-    }
-
-    if (now - last_heartbeat >= config().gossip_interval_ms) {
-        last_heartbeat = now;
-        send_heartbeats();
-    }
-
+    // Check timeouts BEFORE making new connections, so `last_seen` reflects
+    // actual direct communication without being reset by fresh reconnections.
     if (now - last_timeout_check >= config().gossip_interval_ms) {
         last_timeout_check = now;
         // Periodic stale fd cleanup
         for (auto &[nid, peer]: peers_by_node_id) {
             if (nid == self_node.id) continue;
             if (peer.fd >= 0 && !is_socket_alive(peer.fd)) {
+                cancel_pending_proxy_for_peer(nid);
                 fd_to_peer_id.erase(peer.fd);
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, peer.fd, nullptr);
                 close(peer.fd);
                 peer.fd = -1;
                 peer.needs_full_sync = true;
+                peer.retry_at = now + (1000 << std::min(peer.retry_count, 6));
+                peer.retry_count++;
             }
         }
         check_timeouts();
+    }
+
+    // Connect to new peers discovered via gossip
+    for (const auto &[node, status]: cluster_state) {
+        if (node.id == self_node.id) continue;
+        if (status != NodeStatus::ALIVE) continue;
+        if (peers_by_node_id.find(node.id) != peers_by_node_id.end()) continue;
+        get_or_connect(node.id, node.ip, node.port);
+    }
+
+    reconnect_peers();
+
+    if (now - last_heartbeat >= config().gossip_interval_ms) {
+        last_heartbeat = now;
+        send_heartbeats();
     }
 
     static int64_t last_merkle = 0;
@@ -1496,17 +1576,14 @@ void run_background_tasks() {
         }
     }
 
-    if (now - last_tick >= 5000) {
-        last_tick = now;
-        tick_count++;
-        // std::cout << "\033[36mtick " << tick_count << "\033[0m" << std::endl;
-    }
+
 }
 
 [[noreturn]] void run_loop() {
     struct epoll_event events[64];
     while (true) {
-        int n = epoll_wait(epoll_fd, events, 64, 50);
+        run_background_tasks();
+        int n = epoll_wait(epoll_fd, events, 64, 1);
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             uint32_t revents = events[i].events;
@@ -1559,11 +1636,10 @@ void run_background_tasks() {
                         pn = peers_by_node_id.find(pit->second);
                     }
                     if (pn != peers_by_node_id.end() && (revents & EPOLLOUT))
-                        handle_peer_write(pn->second);
+                        handle_peer_write(pn->second, pnid);
                 }
                 continue;
             }
         }
-        run_background_tasks();
     }
 }

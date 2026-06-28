@@ -10,6 +10,8 @@
 #include <map>
 #include <cstdint>
 
+inline constexpr int GOSSIP_FANOUT = 3;
+
 enum class NodeStatus {
     ALIVE,
     SUSPECT,
@@ -46,6 +48,8 @@ extern std::unordered_map<uint64_t, uint64_t> node_versions; // node_id -> versi
 extern std::unordered_map<uint64_t, int> recovery_count;
 extern uint64_t self_version;
 extern uint64_t ring_version;
+
+extern NodeID slot_owners[16384];
 
 void init_cluster(NodeID self, const std::vector<NodeID> &seeds);
 

@@ -78,7 +78,6 @@ DRedisConfig load_config(const std::string& path) {
                       << ", R=" << cfg.read_quorum << ", N=" << cfg.replication_factor << ")" << std::endl;
             std::_Exit(1);
         }
-        std::cout << "[Config] Using default config (no " << path << " found)" << std::endl;
         g_config = cfg;
         return cfg;
     }

@@ -28,7 +28,7 @@ struct DRedisConfig {
 
     // Timing (ms)
     int gossip_interval_ms = 200;
-    int failure_timeout_ms = 2000;
+    int failure_timeout_ms = 10000;
     int dead_timeout_multiplier = 3;
     int tombstone_ttl_ms = 60000;
     int merkle_interval_ms = 30000;

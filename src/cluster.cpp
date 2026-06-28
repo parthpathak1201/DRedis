@@ -1,6 +1,7 @@
 #include "cluster.h"
 #include "config.h"
 #include "crc32c.h"
+#include "network.h"
 #include <iostream>
 #include <unordered_set>
 #include <chrono>
@@ -10,7 +11,6 @@
 #include <arpa/inet.h>
 
 const int VNODE_COUNT = 150;
-const int GOSSIP_FANOUT = 3;
 const int RECOVERY_QUORUM = 3;
 
 NodeID self_node;
@@ -23,12 +23,13 @@ std::unordered_map<uint64_t, int> recovery_count;
 uint64_t self_version = 0;
 uint64_t ring_version = 0;
 size_t active_node_count = 0;
+NodeID slot_owners[16384] = {};
 
 static void build_ring() {
     ring.clear();
     active_node_count = 0;
     for (const auto &[node, status]: cluster_state) {
-        if (status == NodeStatus::ALIVE) {
+        if (status == NodeStatus::ALIVE || status == NodeStatus::SUSPECT) {
             active_node_count++;
             for (int i = 0; i < VNODE_COUNT; ++i) {
                 std::string vnode_key = std::to_string(node.id) + "#" + std::to_string(i);
@@ -36,6 +37,13 @@ static void build_ring() {
                 ring[token] = node;
             }
         }
+    }
+    // Build slot ownership table for CRC16-based key lookup
+    for (size_t i = 0; i < 16384; i++) {
+        uint64_t t = hash_token(std::to_string(i));
+        auto it = ring.lower_bound(t);
+        if (it == ring.end()) it = ring.begin();
+        slot_owners[i] = it->second;
     }
     ring_version++;
 }
@@ -47,10 +55,14 @@ void update_last_seen(const NodeID &node) {
             it->second = NodeStatus::ALIVE;
             node_versions[node.id] = ++self_version;
             suspect_since.erase(node);
+            build_ring();
         } else if (it->second == NodeStatus::DEAD) {
+            // Only resurrect from DEAD if TCP connection is alive — gossip alone is stale
+            auto pit = peers_by_node_id.find(node.id);
+            if (pit == peers_by_node_id.end() || pit->second.fd < 0)
+                return;
             recovery_count[node.id]++;
             if (recovery_count[node.id] >= RECOVERY_QUORUM) {
-                std::cout << "[Cluster] Node " << node.id << " recovered from DEAD to ALIVE" << std::endl;
                 it->second = NodeStatus::ALIVE;
                 node_versions[node.id] = ++self_version;
                 recovery_count.erase(node.id);
@@ -153,12 +165,11 @@ void check_timeouts() {
 
     bool ring_dirty = false;
     for (const auto& node : nodes_to_mark_suspect) {
-        std::cout << "[Cluster] Node " << node.id << " marked SUSPECT" << std::endl;
         mark_suspect(node);
         suspect_since[node] = now;
+        ring_dirty = true;
     }
     for (const auto& node : nodes_to_mark_dead) {
-        std::cout << "[Cluster] Node " << node.id << " marked DEAD" << std::endl;
         mark_dead(node);
         ring_dirty = true;
     }
@@ -169,6 +180,9 @@ void check_timeouts() {
 
 NodeID get_owner(const std::string &key) {
     if (ring.empty()) return self_node;
+    uint16_t slot = static_cast<uint16_t>(hash_token(key) % 16384);
+    if (slot_owners[slot].id != 0)
+        return slot_owners[slot];
     uint64_t token = hash_token(key);
     auto it = ring.lower_bound(token);
     if (it == ring.end()) {
@@ -181,9 +195,16 @@ std::vector<NodeID> get_replicas(const std::string &key) {
     std::vector<NodeID> res;
     if (ring.empty()) return res;
 
+    NodeID owner = get_owner(key);
     std::unordered_set<uint64_t> found_ids;
-    uint64_t token = hash_token(key);
-    auto it = ring.lower_bound(token);
+
+    auto it = ring.begin();
+    for (auto &[tok, node] : ring) {
+        if (node.id == owner.id) {
+            it = ring.find(tok);
+            break;
+        }
+    }
 
     const size_t target_count = std::min((size_t)config().replication_factor, active_node_count);
     if (target_count == 0) return res;
@@ -196,11 +217,7 @@ std::vector<NodeID> get_replicas(const std::string &key) {
             it = ring.begin();
             wrapped = true;
         }
-
-        if (wrapped && it == start_it) {
-            break;
-        }
-
+        if (wrapped && it == start_it) break;
         const NodeID &node = it->second;
         if (found_ids.find(node.id) == found_ids.end()) {
             res.push_back(node);
@@ -348,17 +365,21 @@ void apply_gossip_payload(std::string_view payload) {
                 update_last_seen(gossip_node);
             } else if (gossip_status == NodeStatus::DEAD) {
                 mark_dead(gossip_node);
+                build_ring();
             } else if (gossip_status == NodeStatus::LEFT) {
                 remove_node(gossip_node);
+                build_ring();
             } else if (gossip_status == NodeStatus::ALIVE) {
-                update_last_seen(gossip_node);
+                // gossip alone should not reset the heartbeat timer
             }
             node_versions[id] = gossip_ver;
         } else if (it->second == NodeStatus::SUSPECT) {
             if (gossip_status == NodeStatus::DEAD) {
                 mark_dead(gossip_node);
+                build_ring();
             } else if (gossip_status == NodeStatus::LEFT) {
                 remove_node(gossip_node);
+                build_ring();
             } else if (gossip_status == NodeStatus::ALIVE) {
                 update_last_seen(gossip_node);
             }
@@ -368,6 +389,7 @@ void apply_gossip_payload(std::string_view payload) {
             node_versions[id] = gossip_ver;
         } else if (it->second == NodeStatus::DEAD && gossip_status == NodeStatus::LEFT) {
             remove_node(gossip_node);
+            build_ring();
             node_versions[id] = gossip_ver;
         }
     }

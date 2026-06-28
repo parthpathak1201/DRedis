@@ -138,8 +138,10 @@ std::vector<uint16_t> find_differing_slots(
 
 str get_slot_entries_payload(uint16_t slot) {
     str payload;
+    auto now = current_time_ms();
     for (const auto& [key, entry] : STORE) {
         if (get_slot(key) != slot) continue;
+        if (entry.type != Type::TOMBSTONE && entry.expiry_ms != -1 && entry.expiry_ms <= now) continue;
         payload += serialize_entry(key, entry);
     }
     return payload;

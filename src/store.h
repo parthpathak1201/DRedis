@@ -74,6 +74,8 @@ VClockCmp compare_vclock(
     const std::unordered_map<uint64_t, counter>& a,
     const std::unordered_map<uint64_t, counter>& b);
 
+int64_t current_time_ms();
+
 extern std::unordered_map<Key, ValueEntry> STORE;
 
 ValueEntry* store_get(const Key& key);

@@ -144,6 +144,7 @@ namespace RESP {
     struct Parser {
         str buffer;
         size_t cursor = 0;
+        bool protocol_error = false;
 
         void feed(strv data);
         bool next(COMMAND& cmd);

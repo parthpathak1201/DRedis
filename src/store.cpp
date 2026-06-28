@@ -24,7 +24,7 @@ static int AOF_FD = -1;
 #include <fcntl.h>
 static str AOF_BUFFER;
 
-static int64_t current_time_ms() {
+int64_t current_time_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
@@ -173,11 +173,7 @@ void store_set(const Key& key, ValueEntry&& entry) {
         if (it != STORE.end()) {
             auto cmp = compare_vclock(entry.VecClk, it->second.VecClk);
             if (cmp == VClockCmp::OLDER) {
-                std::cout << "[LWW] OLDER: rejecting update for " << key << std::endl;
                 return;
-            }
-            if (cmp == VClockCmp::CONCURRENT) {
-                std::cout << "[LWW] CONCURRENT: accepting incoming update for " << key << std::endl;
             }
         }
     }

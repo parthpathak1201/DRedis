@@ -38,8 +38,11 @@ static bool parse_trailing_vclock(const TOKENS& args, size_t start,
     for (int64_t i = 0; i < count; i++) {
         size_t pos = start + 2 + static_cast<size_t>(i) * 2;
         if (pos + 1 >= args.size()) return false;
-        uint64_t nid = static_cast<uint64_t>(std::atol(args[pos].c_str()));
-        counter cnt = static_cast<counter>(std::atol(args[pos + 1].c_str()));
+        uint64_t nid, cnt;
+        auto [p, ec] = std::from_chars(args[pos].data(), args[pos].data() + args[pos].size(), nid);
+        if (ec != std::errc()) return false;
+        auto [p2, ec2] = std::from_chars(args[pos + 1].data(), args[pos + 1].data() + args[pos + 1].size(), cnt);
+        if (ec2 != std::errc()) return false;
         vclock[nid] = cnt;
     }
     return true;
@@ -180,7 +183,8 @@ str handle_del(const TOKENS &args) {
     if (args.empty()) return RESP::error("wrong number of arguments for 'del' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t i = 0; i < args.size(); i++) {
+        for (size_t i = args.size(); i > 0; ) {
+            i--;
             if (args[i] == "VCLOCK") { data_end = i; break; }
         }
     }
@@ -342,7 +346,8 @@ str handle_mset(const TOKENS &args) {
         return RESP::error("wrong number of arguments for 'mset' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t i = 0; i < args.size(); i++) {
+        for (size_t i = args.size(); i > 0; ) {
+            i--;
             if (args[i] == "VCLOCK") { data_end = i; break; }
         }
         if (data_end % 2 != 0) data_end = args.size();
@@ -363,7 +368,8 @@ str handle_hset(const TOKENS &args) {
     // Find data end (account for trailing VCLOCK in replication mode)
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -530,7 +536,8 @@ str handle_sadd(const TOKENS &args) {
     if (args.size() < 2) return RESP::error("wrong number of arguments for 'sadd' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -651,7 +658,8 @@ str handle_zadd(const TOKENS &args) {
     if (args.size() < 3) return RESP::error("wrong number of arguments for 'zadd' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -1002,7 +1010,8 @@ str handle_rpush(const TOKENS &args) {
     if (args.size() < 2) return RESP::error("wrong number of arguments for 'rpush' command");
     size_t data_end = args.size();
     if (g_replication_mode) {
-        for (size_t vi = 1; vi < args.size(); vi++) {
+        for (size_t vi = args.size(); vi > 1; ) {
+            vi--;
             if (args[vi] == "VCLOCK") { data_end = vi; break; }
         }
     }
@@ -1391,7 +1400,7 @@ str handle_cluster(const TOKENS &args) {
     }
     if (sub == "KEYSLOT") {
         if (args.size() < 2) return RESP::error("wrong number of arguments for 'cluster keyslot' command");
-        return RESP::integer(crc16(args[1]) & 0x3FFF);
+        return RESP::integer(static_cast<uint16_t>(hash_token(args[1]) % 16384));
     }
     if (sub == "SLOTS") {
         TOKENS all_entries;

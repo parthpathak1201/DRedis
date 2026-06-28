@@ -134,6 +134,13 @@ void mod_epoll(int fd, uint32_t events) {
 void close_client(int fd) {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
 
+    for (auto it = pending_proxy.begin(); it != pending_proxy.end(); ) {
+        if (it->second.client_fd == fd)
+            it = pending_proxy.erase(it);
+        else
+            ++it;
+    }
+
     close(fd);
     clients.erase(fd);
 }
@@ -357,10 +364,9 @@ bool handle_read(Client &c) {
 
     COMMAND cmd;
     while (true) {
-        size_t cmd_start = c.parser.cursor;
         if (!c.parser.next(cmd)) {
-            if (cmd_start < c.parser.buffer.size()) {
-                size_t next_crlf = c.parser.buffer.find("\r\n", cmd_start);
+            if (c.parser.protocol_error) {
+                size_t next_crlf = c.parser.buffer.find("\r\n");
                 if (next_crlf != str::npos) {
                     c.parser.cursor = next_crlf + 2;
                     c.parser.clear_consumed();
@@ -1021,7 +1027,7 @@ void process_bin_frame(const BIN::Frame &frame, uint64_t peer_node_id) {
             // Check simple proxy path first (single-key proxied commands)
             auto ppx = pending_proxy.find(frame.header.msg_id);
             if (ppx != pending_proxy.end()) {
-                write(2, "<", 1); auto cit = clients.find(ppx->second.client_fd);
+                auto cit = clients.find(ppx->second.client_fd);
                 if (cit != clients.end()) {
                     cit->second.write_buf += frame.payload;
                     uint32_t flags = EPOLLIN;
@@ -1186,6 +1192,8 @@ void handle_peer_write(PeerConnection &peer, uint64_t peer_node_id) {
                 mod_epoll(peer.fd, flags);
             }
         }
+        if (peer.write_buf.empty())
+            mod_epoll(peer.fd, EPOLLIN);
         return;
     }
     ssize_t n = send(peer.fd, peer.write_buf.data(), peer.write_buf.size(), MSG_NOSIGNAL);
@@ -1574,11 +1582,7 @@ void run_background_tasks() {
         }
     }
 
-    if (now - last_tick >= 5000) {
-        last_tick = now;
-        tick_count++;
-        // std::cout << "\033[36mtick " << tick_count << "\033[0m" << std::endl;
-    }
+
 }
 
 [[noreturn]] void run_loop() {

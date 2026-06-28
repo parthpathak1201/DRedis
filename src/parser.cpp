@@ -224,6 +224,7 @@ namespace RESP {
 
     bool Parser::next(COMMAND &cmd) {
         cmd = {commandType::UNKNOWN, {}};
+        protocol_error = false;
 
         // Skip bare \r\n that may have accumulated (e.g. from bench/clients)
         while (cursor + 1 < buffer.size() && buffer[cursor] == '\r' && buffer[cursor + 1] == '\n')
@@ -247,13 +248,11 @@ namespace RESP {
 
             long long count;
             auto [ptr, ec] = std::from_chars(count_sv.data(), count_sv.data() + count_sv.size(), count);
-            if (ec != std::errc()) { // Handles invalid characters
-                cursor = initial_cursor; // Malformed, but rewind to allow recovery/logging
-                return false;
+            if (ec != std::errc()) {
+                cursor = initial_cursor; protocol_error = true; return false;
             }
             if (count < -1) {
-                cursor = initial_cursor;
-                return false;
+                cursor = initial_cursor; protocol_error = true; return false;
             }
 
             if (count == -1) { // Null array
@@ -262,8 +261,11 @@ namespace RESP {
 
             extracted_strings.reserve(count);
             for (int64_t i = 0; i < count; i++) {
-                if (cursor >= buffer.size() || buffer[cursor] != '$') {
+                if (cursor >= buffer.size()) {
                     cursor = initial_cursor; return false;
+                }
+                if (buffer[cursor] != '$') {
+                    cursor = initial_cursor; protocol_error = true; return false;
                 }
                 cursor++;
 
@@ -275,10 +277,10 @@ namespace RESP {
                 long long len;
                 auto [len_ptr, len_ec] = std::from_chars(len_sv.data(), len_sv.data() + len_sv.size(), len);
                 if (len_ec != std::errc()) {
-                    cursor = initial_cursor; return false;
+                    cursor = initial_cursor; protocol_error = true; return false;
                 }
                 if (len < -1) {
-                    cursor = initial_cursor; return false;
+                    cursor = initial_cursor; protocol_error = true; return false;
                 }
 
                 if (len == -1) {
@@ -287,7 +289,10 @@ namespace RESP {
                 }
 
                 auto arg = read_bytes(len);
-                if (arg.data() == nullptr) { // read_bytes returns empty view on failure
+                if (arg.data() == nullptr) {
+                    if (cursor + len + 2 <= buffer.size()) {
+                        protocol_error = true;
+                    }
                     cursor = initial_cursor; return false;
                 }
                 extracted_strings.emplace_back(arg);

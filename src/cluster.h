@@ -55,8 +55,6 @@ void init_cluster(NodeID self, const std::vector<NodeID> &seeds);
 
 uint64_t hash_token(const std::string &key);
 
-uint16_t crc16(const std::string &s);
-
 void add_node(const NodeID &node);
 
 void remove_node(const NodeID &node); // For graceful leave

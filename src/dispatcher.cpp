@@ -28,13 +28,13 @@ std::vector<str> extract_keys(const COMMAND& cmd) {
         case commandType::DEL:
         case commandType::EXISTS: {
             std::vector<str> keys;
-            for (size_t i = 1; i < cmd.args.size(); i++)
+            for (size_t i = 0; i < cmd.args.size(); i++)
                 keys.push_back(cmd.args[i]);
             return keys;
         }
         case commandType::MSET: {
             std::vector<str> keys;
-            for (size_t i = 1; i < cmd.args.size(); i += 2)
+            for (size_t i = 0; i < cmd.args.size(); i += 2)
                 keys.push_back(cmd.args[i]);
             return keys;
         }
@@ -241,7 +241,7 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         if (cmd.type == commandType::MGET) {
             TOKENS local_args;
             for (auto idx : local_indices)
-                local_args.push_back(cmd.args[idx + 1]);
+                local_args.push_back(cmd.args[idx]);
             COMMAND local_cmd = cmd;
             local_cmd.args = local_args;
             auto elements = split_resp_responses(execute_command(local_cmd));
@@ -250,8 +250,8 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         } else if (cmd.type == commandType::MSET) {
             TOKENS local_args;
             for (auto idx : local_indices) {
+                local_args.push_back(cmd.args[2 * idx]);
                 local_args.push_back(cmd.args[2 * idx + 1]);
-                local_args.push_back(cmd.args[2 * idx + 2]);
             }
             COMMAND local_cmd = cmd;
             local_cmd.args = local_args;
@@ -259,7 +259,7 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         } else {
             TOKENS local_args;
             for (auto idx : local_indices)
-                local_args.push_back(cmd.args[idx + 1]);
+                local_args.push_back(cmd.args[idx]);
             COMMAND local_cmd = cmd;
             local_cmd.args = local_args;
             str local_resp = execute_command(local_cmd);
@@ -272,18 +272,18 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
             local_cmd.args.clear();
             for (auto idx : local_indices) {
                 if (cmd.type == commandType::MSET) {
+                    local_cmd.args.push_back(cmd.args[2 * idx]);
                     local_cmd.args.push_back(cmd.args[2 * idx + 1]);
-                    local_cmd.args.push_back(cmd.args[2 * idx + 2]);
                 } else {
-                    local_cmd.args.push_back(cmd.args[idx + 1]);
+                    local_cmd.args.push_back(cmd.args[idx]);
                 }
             }
             for (auto idx : local_indices) {
                 str key;
                 if (cmd.type == commandType::MSET)
-                    key = cmd.args[2 * idx + 1];
+                    key = cmd.args[2 * idx];
                 else
-                    key = cmd.args[idx + 1];
+                    key = cmd.args[idx];
                 embed_vclock(local_cmd.args, key);
             }
             str embedded = RESP::serialize_command(local_cmd);
@@ -291,9 +291,9 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
             if (!local_indices.empty()) {
                 str any_key;
                 if (cmd.type == commandType::MSET)
-                    any_key = cmd.args[2 * local_indices[0] + 1];
+                    any_key = cmd.args[2 * local_indices[0]];
                 else
-                    any_key = cmd.args[local_indices[0] + 1];
+                    any_key = cmd.args[local_indices[0]];
                 queue_replica(embedded, get_replicas(any_key), -1, "");
             }
         }
@@ -309,15 +309,15 @@ static void dispatch_multi_key(Client& client, COMMAND& cmd, const std::vector<s
         TOKENS remote_args;
         if (cmd.type == commandType::MGET) {
             for (auto idx : indices)
-                remote_args.push_back(cmd.args[idx + 1]);
+                remote_args.push_back(cmd.args[idx]);
         } else if (cmd.type == commandType::MSET) {
             for (auto idx : indices) {
+                remote_args.push_back(cmd.args[2 * idx]);
                 remote_args.push_back(cmd.args[2 * idx + 1]);
-                remote_args.push_back(cmd.args[2 * idx + 2]);
             }
         } else {
             for (auto idx : indices)
-                remote_args.push_back(cmd.args[idx + 1]);
+                remote_args.push_back(cmd.args[idx]);
         }
 
         COMMAND remote_cmd = cmd;
@@ -425,7 +425,7 @@ void Dispatcher::dispatch(Client& client, COMMAND& cmd) {
         }
 
         // Fallback: MOVED if owner unreachable
-        uint16_t slot = crc16(keys[0]) & 0x3FFF;
+        uint16_t slot = static_cast<uint16_t>(hash_token(keys[0]) % 16384);
         client.write_buf += RESP::error_moved(slot, owner.ip, owner.port);
     }
 }

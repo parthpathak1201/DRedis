@@ -62,12 +62,6 @@ static void set_tcp_keepalive(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
-static int64_t current_time_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    ).count();
-}
-
 void init_server(str port) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -1469,12 +1463,12 @@ void run_background_tasks() {
         }
     }
 
-    // Timeout pending proxy requests after 2s
+    // Timeout pending proxy requests after 5s
     for (auto it = pending_proxy.begin(); it != pending_proxy.end();) {
-        if (now - it->second.created_at >= 2000) {
+        if (now - it->second.created_at >= 5000) {
             auto cit = clients.find(it->second.client_fd);
             if (cit != clients.end()) {
-                write(2, "T", 1); cit->second.write_buf += RESP::error("proxy request timed out");
+                cit->second.write_buf += RESP::error("proxy request timed out");
                 uint32_t flags = EPOLLIN;
                 if (!cit->second.write_buf.empty())
                     flags |= EPOLLOUT;

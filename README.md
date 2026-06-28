@@ -1,104 +1,126 @@
 # DRedis
 
-A distributed, leaderless key-value store inspired by Redis and Amazon
-Dynamo, built from scratch in C++. Built as a learning project to go
-deep on distributed systems internals — consistent hashing, gossip-based
-failure detection, quorum reads/writes, vector clocks, and Merkle-tree
-anti-entropy repair.
-
-It speaks RESP2, so it works directly with `redis-cli` and `redis-benchmark` —
-no custom client needed.
-
-## Quick start
-
-```bash
-./demo.sh
-```
-
-This builds the image, spins up a 10-node cluster on a dedicated Docker
-network, and prints connection info. You get:
-
-- A live dashboard at `http://localhost:6381/` — cluster membership,
-  ring state, replication queue depth, AOF size, all refreshed every
-  2 seconds
-- A Redis-compatible CLI at `localhost:6380`
-
-```bash
-redis-cli -p 6380 SET mykey myvalue
-docker exec node1 redis-cli -p 6380 GET mykey   # written on node0, read from node1
-```
-
-Kill a node and watch the dashboard react:
-
-```bash
-docker stop node5
-# refresh dashboard → node5 goes DEAD, ring rebuilds around it
-docker start node5
-# node5 rejoins and anti-entropy heals any missed writes within ~30s
-# we can also simulate such scenarios in docker integrated IDEs like CLion (which I used)
-```
-
-Cleanup:
-
-```bash
-docker rm -f $(docker ps -a --filter "label=demo=dredis-demo" --format "{{.ID}}")
-docker network rm dredis-demo
-```
-
-## What this demonstrates
-
-- **Consistent hashing** with virtual nodes (150 per physical node) for
-  even key distribution and minimal reshuffling on membership change
-- **SWIM-inspired failure detection** — gossip-based membership with
-  suspicion before death, generation numbers to distinguish a restarted
-  node from a stale one, and periodic heartbeat broadcast to all peers
-  (full mesh transport, with state-change information piggybacked on
-  each heartbeat)
-- **Leaderless replication** with configurable write/read quorum
-  (W + R > N enforced at startup)
-- **Vector clocks** for conflict resolution, with last-write-wins
-  tiebreak on concurrent writes
-- **Merkle-tree anti-entropy** — nodes periodically diff a 1024-leaf
-  hash tree with their peers and repair only the buckets that actually
-  diverged, instead of comparing every key
-- **Tombstone-based deletes** so a stale replica can't resurrect a key
-  that was legitimately deleted elsewhere
-- **Quorum reads with read-repair** — when enabled, a read fans out to
-  multiple replicas, returns the freshest value by vector clock, and
-  asynchronously patches any replica that was behind
-- **AOF persistence** per node, with background rewrite/compaction
-- Five Redis data types — String, List, Hash, Set, Sorted Set — plus
-  basic Stream support
+A distributed, leaderless Redis-compatible key-value store written in C++17/20. Implements gossip-based membership, consistent hashing, vector clock CRDTs, Merkle tree anti-entropy, and a custom binary protocol — all in a single-threaded epoll event loop.
 
 ## Architecture
 
-Every node runs the same binary. There's no special coordinator process —
-whichever node a client connects to acts as the coordinator for that
-request: serving it directly if it owns the key, or proxying it
-internally to the correct owner if not.
+Every node is identical — no leader, no replicaset roles. Each node owns a subset of the 16384 hash slots (via CRC32C consistent hashing with 150 virtual nodes per physical node) and stores replicas for slots owned by other nodes.
 
 ```
-src/
-├── network.cpp      epoll event loop, client + peer connections, dashboard HTTP
-├── dispatcher.cpp   routes commands to local store or proxies to the owning node
-├── cmd.cpp          command handlers (GET/SET/LPUSH/HSET/ZADD/...)
-├── cluster.cpp       gossip, membership, consistent hash ring
-├── merkle.cpp        Merkle tree construction + diffing for anti-entropy
-├── store.cpp         in-memory KV store, AOF read/write, vector clocks
-├── parser.cpp         RESP2 parser/serializer + internal binary RPC frame format
-├── config.cpp         config file + env var parsing
-└── dashboard.cpp      JSON metrics endpoint + embedded HTML dashboard
+Client (redis-cli)
+  │  RESP2 (TCP :6380)
+  ▼
+Dispatcher ──► Router ──► Command Handler
+  │                          ▲
+  ▼                          │
+Proxy Layer ─────────────────┘   (if key not local)
+  │
+  ▼
+Replication Queue ──► Peers (binary protocol, TCP :client_port+10000)
+  │
+  ▼
+Store (vector clocks, tombstones, AOF)
 ```
+
+Inter-node traffic uses a custom binary frame: 30-byte header (magic, type, sender, length, CRC32C checksum) + variable payload. Gossip, replication, proxy requests, and anti-entropy all share this framing.
+
+## Quick Start
+
+```bash
+./cluster_init.sh                     # 10-node Docker cluster
+sleep 15                              # wait for gossip convergence
+redis-cli -p 6380 SET mykey myvalue
+docker exec node3 redis-cli -p 6380 GET mykey   # replicated
+open http://localhost:6381/            # dashboard
+```
+
+## Configuration
+
+| Env Var | Config Key | Default | Description |
+|---------|------------|---------|-------------|
+| `DREDIS_PORT` | `client_port` | 6380 | RESP2 port |
+| `DREDIS_IP` | `ip` | auto | Advertised IP |
+| `DREDIS_SEEDS` | `seed` | — | Comma-separated `host:port` seeds |
+| `DREDIS_REPL_FACTOR` | `replication_factor` | 3 | Replicas per key |
+| `DREDIS_WRITE_QUORUM` | `write_quorum` | 2 | Acks needed before responding to client |
+| `DREDIS_READ_QUORUM` | `read_quorum` | 2 | (not enforced — reads hit one node) |
+| `DREDIS_STRICT_QUORUM` | `strict_quorum` | no | Fail writes if zero replicas connected |
+
+Also available via `dredis.conf`. The server refuses to start if `write_quorum + read_quorum <= replication_factor`.
+
+## Supported Commands
+
+| Category | Commands |
+|----------|----------|
+| Strings | `GET`, `SET`, `MGET`, `MSET`, `GETSET`, `SETNX`, `SETEX`, `DEL`, `EXISTS`, `KEYS`, `RENAME`, `APPEND`, `STRLEN`, `INCR`, `INCRBY`, `DECR`, `DECRBY` |
+| Hashes | `HSET`, `HMSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HINCRBY` |
+| Lists | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LINSERT`, `LREM`, `LSET` |
+| Sets | `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`, `SPOP` |
+| Sorted Sets | `ZADD`, `ZREM`, `ZRANGE`, `ZREVRANGE`, `ZRANK`, `ZSCORE`, `ZCARD`, `ZPOPMIN`, `ZINCRBY`, `ZRANGEBYSCORE` |
+| Streams | `XADD` |
+| Keys | `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST`, `TYPE`, `DBSIZE`, `FLUSHDB` |
+| Cluster | `CLUSTER INFO`, `CLUSTER NODES`, `CLUSTER KEYSLOT`, `CLUSTER SLOTS`, `CLUSTER MEET`, `CLUSTER FORGET`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT` |
+| Admin | `PING`, `INFO`, `CONFIG GET`, `HELLO`, `QUIT`, `AUTH` (no-op), `SELECT` (no-op), `CLIENT` (no-op), `BGREWRITEAOF`, `DASHBOARDSTATS` |
+
+## How It Works
+
+### Consistent Hashing
+
+A key's owner is `slot_owners[CRC32C(key) % 16384]`, where each slot is assigned to a node via a consistent hash ring with 150 virtual nodes per physical node. Membership changes rebuild the ring and slot table. Lookup is O(1) via the cached array.
+
+### Gossip Membership
+
+Every 200ms, each node sends a PING with gossip payload to 3 random peers. The payload carries up to 4 node entries (self + 3 shuffled) with ID, IP, port, status, generation, and version. Recipients merge via generation (always wins) then version (higher wins within same generation).
+
+Failure detection: 10s no contact → SUSPECT. 30s in SUSPECT → DEAD. DEAD nodes leave the ring. Resurrection from DEAD requires 3 gossip confirmations + a live TCP socket.
+
+### Vector Clocks
+
+Each value carries `node_id → counter`. Local writes bump self. Replication embeds the vector clock via a `VCLOCK` token appended to commands. `store_set` (`src/store.cpp:163`) compares:
+
+- **Newer/Equal**: accepts
+- **Older**: rejects (stale replication)
+- **Concurrent**: accepts (last-writer-wins by arrival order)
+
+A global flag `g_replication_mode` suppresses local clock bumps during replay from peers.
+
+### Write Path
+
+1. Client sends SET via RESP2
+2. Dispatcher computes slot → owner via `get_owner()` (`src/cluster.cpp:181`)
+3. **Local**: execute, embed vclock, append to AOF, queue replication to `get_replicas()` (walks the ring for N-1 other nodes)
+4. **Remote**: wrap as `PROXY_REQUEST` frame → owner node → executes → responds with `PROXY_RESPONSE`
+
+The initiating node waits for acks from `min(write_quorum, connected_replicas)` replicas. If connected_replicas < write_quorum, the effective quorum degrades — the write still goes through but with fewer confirmations. A 5s timeout returns an error to the client, though the write may have already been applied locally and on some replicas. Non-idempotent commands (INCR, APPEND, LPUSH) cannot be safely retried.
+
+### Read Path
+
+Reads hit exactly one node — either the local store (if the key's owner) or the remote owner via `PROXY_REQUEST`/`PROXY_RESPONSE`. There is no read quorum or read-repair in the current implementation. The `READ_REQUEST`/`READ_RESPONSE` frame types exist in the protocol but are not wired into the client request path.
+
+### Anti-Entropy (Merkle Trees)
+
+Every 30s, each node computes a 1024-leaf Merkle tree over all keys (including tombstones). Leaf hashes use CRC32C XOR-combined — fast, not cryptographic. Nodes exchange tree hashes; differing leaves trigger a full slot sync (`FULL_SYNC_CHUNK`) with LWW reconciliation on the receiver.
+
+### Tombstones
+
+Deletes place a tombstone (`Type::TOMBSTONE`) with the current vector clock rather than removing the entry. This prevents key resurrection during anti-entropy. Tombstones expire after `tombstone_ttl_ms` (default 60s) and are garbage-collected by `expire_sweep` (`src/store.cpp:336`).
+
+### Full Sync
+
+When a peer reconnects, it sends `FULL_SYNC_REQUEST`. The responder serializes the store as RESP2 commands in chunks of 50 keys. The receiver applies them with `g_replication_mode = true` so vector clocks are preserved and stale entries are rejected.
+
+### Persistence (AOF)
+
+Append-only file at `data/append_only.aof`. Every write command is appended before the response is sent. AOF rewrite (`rewriteAOF`, `src/store.cpp:451`) re-serializes current state — note this runs inside the epoll event loop and blocks all I/O while in progress. Fsync: `everysec` (default), `always`, or `no`.
 
 ## Benchmarks
 
-Tested locally — M-5 MacBook, Docker Desktop, 10 containers sharing one host.
-These numbers reflect that shared-host setup, not isolated hardware per node.
+Tested on an M5 MacBook with Docker Desktop — 10 containers sharing one host. These are not isolated hardware measurements.
 
-### Single node (isolated, no contention)
+### Single Node (no contention)
 
-| Command | Req/s   |
-|---|---------|
+| Command | Req/s |
+|---------|-------|
 | SET | 307,692 |
 | GET | 301,205 |
 | INCR | 306,748 |
@@ -107,76 +129,67 @@ These numbers reflect that shared-host setup, not isolated hardware per node.
 | ZADD | 311,526 |
 | MSET (10 keys) | 133,156 |
 
-### 10-node cluster (concurrent load, shared host)
+### 10-Node Cluster (concurrent load)
 
-| Metric | SET        | GET        |
-|---|------------|------------|
-| Aggregate (sum across 10 nodes) | ~353k req/s | ~710k req/s |
+| Metric | SET | GET |
+|--------|-----|-----|
+| Aggregate across 10 nodes | ~353k req/s | ~710k req/s |
 | Average per node | ~35k req/s | ~71k req/s |
 
-Each node was benchmarked directly and concurrently (one `redis-benchmark`
-process per node, run in parallel). Aggregate throughput roughly matches
-or exceeds the single-node ceiling, which suggests the cluster's internal
-coordination (gossip, replication, anti-entropy) isn't the bottleneck at
-this scale — the limiting factor is host CPU shared across 10 single-threaded
-processes, not the distributed system overhead itself.
+Individual nodes saturate below their solo ceiling due to shared host CPU across 10 single-threaded processes.
 
-**Note:** this is 10 nodes on one machine, not 10 independent hosts.
-On real separate hardware I'd expect each node closer to its solo ~300k
-ceiling, and a correspondingly higher real aggregate. I haven't tested
-that yet.
+### Proxy-Hop Overhead
 
-I also tried routing all traffic through a single entrypoint node with a
-large randomized keyspace, to measure proxy-hop overhead specifically
-(i.e. client → one node → internally routed to the correct owner). That
-test exposed a real bottleneck: a high volume of concurrent proxied
-writes through one node degrades sharply, most likely because proxy
-requests queue up faster than they drain under that specific load shape.
-I haven't root-caused it yet — flagging it here rather than hiding it,
-since it's a genuine limitation worth knowing about.
+Routing all traffic through a single node with random keyspace degrades write throughput sharply under high concurrency. Not yet root-caused.
 
-### Fault tolerance (manually verified)
+### Fault Tolerance (manually verified)
 
-- **Node killed mid-traffic** → reads/writes for its keys continue via
-  replicas, no downtime for unaffected keys
-- **Node restarted after being down** → anti-entropy heals it within
-  ~30 seconds, including keys written entirely during its downtime
-- **Key deleted while a replica was offline** → tombstone correctly
-  prevents the key from reappearing when that replica rejoins
+| Scenario | Observed behavior |
+|----------|-------------------|
+| Node killed mid-traffic | Keys served via replicas; other keys unaffected |
+| Node restarted after downtime | Anti-entropy heals within ~30s |
+| Key deleted while replica offline | Tombstone prevents resurrection on rejoin |
 
-## Configuration
+## Known Limitations
 
-Nodes are configured via environment variables (used by `demo.sh`) or a
-`dredis.conf` file:
+- **No read quorum**: Reads hit one node. A stale replica can serve stale data until anti-entropy converges.
+- **No retry safety**: Non-idempotent commands (INCR, APPEND) can be double-applied if the client retries a timed-out write.
+- **Eventually consistent**: No read-your-writes, monotonic read, or strong consistency guarantee. Vector clocks detect but don't resolve concurrent writes — last-writer-wins by arrival order.
+- **Quorum degrades under partition**: If fewer than `write_quorum` replicas are reachable, the effective quorum silently shrinks to however many are connected. The write still executes locally before the quorum check, so a timeout error does not mean the write was rolled back.
+- **No cross-slot atomicity**: Multi-key operations (MGET, MSET, DEL, EXISTS) scatter by owner and gather partial results. A timeout returns partial results with nulls.
+- **Blocking operations in event loop**: AOF rewrite and Merkle tree computation iterate the entire store inside the main epoll loop, blocking all I/O for the duration.
+- **Memory estimate is approximate**: `entry_memory_estimate` (`src/store.cpp:143`) does not account for container heap overhead (`unordered_map`, `deque`). `maxmemory` is a rough guard, not a hard limit.
+- **No TLS, no auth** (AUTH accepted but ignored), **no RDB snapshots**.
 
-| Variable | Default | Description |
-|---|---|---|
-| `DREDIS_PORT` | 6380 | Client + cluster port |
-| `DREDIS_IP` | 127.0.0.1 | This node's advertised address |
-| `DREDIS_SEEDS` | — | Comma-separated `host:port` list for gossip bootstrap |
-| `DREDIS_REPL_FACTOR` | 3 | Keys are stored on this many nodes |
-| `DREDIS_WRITE_QUORUM` | 2 | Writes ack after this many confirmations |
-| `DREDIS_READ_QUORUM` | 2 | Reads wait for this many responses (if quorum reads enabled) |
+## Binary Frame Protocol
 
-`write_quorum + read_quorum > replication_factor` is enforced at startup —
-the node refuses to boot if the invariant is violated.
+```
+┌──────────────────────────────────────────────┐
+│ Magic:      0xDDEE1234   (4 bytes)           │
+│ Version:    1            (1 byte)            │
+│ MsgType:    see below    (1 byte)            │
+│ MsgID:      uint64_t     (8 bytes)           │
+│ SenderID:   uint64_t     (8 bytes)           │
+│ PayloadLen: uint32_t     (4 bytes)           │
+│ Checksum:   CRC32C       (4 bytes)           │
+├──────────────────────────────────────────────┤
+│ Payload (≤10 MB)                             │
+└──────────────────────────────────────────────┘
+Total header: 30 bytes (packed).
+```
 
-## Status & scope
-
-This is a learning project, not a production system.
-
-Known gaps:
-- No TLS on client or inter-node connections
-- No formal chaos-engineering test suite (fault tolerance above was
-  verified manually, not via automated partition/kill scripts)
-- Single-AZ / single-host assumptions throughout — not tested across
-  real separate machines
-- The proxy-overhead bottleneck noted in the benchmarks section above
-  is unresolved
-
-## Testing
-
-Manual cluster tests (replication, node failure, anti-entropy, tombstone
-correctness) were run by hand against a live `demo.sh` cluster using
-`redis-cli` and `docker stop`/`start`/`network disconnect`. See the
-Fault tolerance section above for what was verified.
+| Type | Code | Direction | Purpose |
+|------|------|-----------|---------|
+| `PING` | 0x0F | both | Heartbeat + gossip payload |
+| `CLUSTER_JOIN` | 0x0B | outbound | Node introduction |
+| `CLUSTER_JOIN_ACK` | 0x0C | inbound | Acknowledge join |
+| `REPLICATE_PUT` | 0x04 | outbound | Replicate a write |
+| `REPLICATE_ACK` | 0x06 | inbound | Replication confirmation |
+| `PROXY_REQUEST` | 0x0D | both | Forward client command |
+| `PROXY_RESPONSE` | 0x0E | both | Proxy result |
+| `READ_REQUEST` | 0x07 | — | Defined but not wired |
+| `READ_RESPONSE` | 0x08 | — | Defined but not wired |
+| `ANTIENTROPY_HASH` | 0x09 | both | Merkle tree exchange |
+| `ANTIENTROPY_SYNC` | 0x0A | both | Request slot entries |
+| `FULL_SYNC_REQUEST` | 0x11 | outbound | Request full state |
+| `FULL_SYNC_CHUNK` | 0x12 | inbound | Full state chunk |
